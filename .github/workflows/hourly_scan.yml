@@ -1,10 +1,8 @@
-name: Crypto Alert Bot – Hourly Scan
-
+name: Crypto Alert Bot - Hourly Scan
 on:
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch:
-
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -17,7 +15,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-       run: pip install requests
+        run: pip install requests
       - name: Run crypto alert scan
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
