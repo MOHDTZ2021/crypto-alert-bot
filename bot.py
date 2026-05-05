@@ -1,13 +1,12 @@
 """
-Crypto Telegram Alert Bot
-=========================
-Checks every hour:
-  1. 5%+ pump (1h candle change)
-  2. Breakout (price breaks 20-candle high)
-  3. EMA rejection (price bounces off EMA20 or EMA50)
+Crypto Telegram Alert Bot (CoinGecko API)
+==========================================
+Works in Malaysia — CoinGecko is a data aggregator, not an exchange.
 
-Data source : Binance Public API (no key needed)
-Notification : Telegram Bot API
+Checks every hour:
+  1. 5%+ pump (1h price change)
+  2. 24h Breakout (price near 24h high)
+  3. EMA rejection (EMA20/50 on 30min candles)
 """
 
 import os
@@ -15,205 +14,181 @@ import time
 import requests
 from datetime import datetime, timezone
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")   # set in GitHub Secrets
-CHAT_ID        = os.environ.get("CHAT_ID", "")          # your personal chat id
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.environ.get("CHAT_ID", "")
 
-PUMP_THRESHOLD  = 5.0     # % gain in last 1 hour to trigger pump alert
+PUMP_THRESHOLD  = 5.0
 EMA_PERIODS     = [20, 50]
-KLINE_LIMIT     = 55      # enough candles for EMA50
-EMA_TOUCH_PCT   = 0.003   # wick must come within 0.3% of EMA to count as "touch"
-TOP_PAIRS_LIMIT = 80      # only scan top 80 USDT pairs by 24h volume (speed)
+EMA_TOUCH_PCT   = 0.003
+TOP_COINS       = 100   # top 100 coins by market cap
 
-BINANCE_BASE    = "https://api.binance.com/api/v3"
+COINGECKO_BASE  = "https://api.coingecko.com/api/v3"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
-def send_telegram(message: str) -> None:
-    """Send a Telegram message (silently fail if token not set)."""
+def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[WARN] TELEGRAM_TOKEN or CHAT_ID not set — printing to console.")
         print(message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id"    : CHAT_ID,
-        "text"       : message,
-        "parse_mode" : "Markdown",
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code != 200:
-            print(f"[ERROR] Telegram API: {resp.text}")
+            print(f"Telegram error: {resp.text}")
     except Exception as e:
-        print(f"[ERROR] Telegram send failed: {e}")
+        print(f"Telegram send failed: {e}")
 
+# ── CoinGecko Data ────────────────────────────────────────────────────────────
 
-def get_top_usdt_pairs() -> list[dict]:
+def get_top_coins():
     """
-    Fetch 24h ticker for all USDT spot pairs.
-    Returns top N by quoteVolume (USDT traded), sorted descending.
+    Fetch top coins with 1h, 24h price change data.
+    Returns list of coin dicts.
     """
-    url = f"{BINANCE_BASE}/ticker/24hr"
-    resp = requests.get(url, timeout=15)
+    url = f"{COINGECKO_BASE}/coins/markets"
+    params = {
+        "vs_currency"                    : "usd",
+        "order"                          : "market_cap_desc",
+        "per_page"                       : TOP_COINS,
+        "page"                           : 1,
+        "sparkline"                      : False,
+        "price_change_percentage"        : "1h,24h",
+        "locale"                         : "en",
+    }
+    resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-
-    usdt_pairs = [
-        d for d in data
-        if d["symbol"].endswith("USDT")
-        and not any(x in d["symbol"] for x in ["UP", "DOWN", "BEAR", "BULL"])  # no leveraged tokens
-    ]
-    # Sort by 24h USDT volume, take top N
-    usdt_pairs.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    return usdt_pairs[:TOP_PAIRS_LIMIT]
+    return resp.json()
 
 
-def get_klines(symbol: str, interval: str = "1h", limit: int = KLINE_LIMIT) -> list:
-    """Fetch OHLCV candles from Binance. Returns list of lists."""
-    url = f"{BINANCE_BASE}/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+def get_ohlc(coin_id, days=1):
+    """
+    Fetch OHLC candles for a coin.
+    days=1 → 30min candles (~48 candles)
+    days=2 → 30min candles (~96 candles)
+    Returns list of [timestamp, open, high, low, close]
+    """
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
     resp = requests.get(url, params=params, timeout=10)
     if resp.status_code != 200:
         return []
     return resp.json()
 
 
-# ── Indicator Calculations ────────────────────────────────────────────────────
+# ── Indicators ────────────────────────────────────────────────────────────────
 
-def calc_ema(prices: list[float], period: int) -> list[float]:
-    """Calculate EMA for a price series. Returns same-length list."""
+def calc_ema(prices, period):
     if len(prices) < period:
         return []
     k = 2.0 / (period + 1)
-    ema_values = [sum(prices[:period]) / period]  # seed with SMA
-    for price in prices[period:]:
-        ema_values.append(price * k + ema_values[-1] * (1 - k))
-    # Pad front with None to keep index alignment
-    pad = [None] * (len(prices) - len(ema_values))
-    return pad + ema_values
-
-
-def parse_klines(raw: list) -> dict:
-    """Extract OHLCV lists from Binance kline response."""
-    return {
-        "open"  : [float(k[1]) for k in raw],
-        "high"  : [float(k[2]) for k in raw],
-        "low"   : [float(k[3]) for k in raw],
-        "close" : [float(k[4]) for k in raw],
-        "volume": [float(k[5]) for k in raw],
-    }
+    ema_vals = [sum(prices[:period]) / period]
+    for p in prices[period:]:
+        ema_vals.append(p * k + ema_vals[-1] * (1 - k))
+    pad = [None] * (len(prices) - len(ema_vals))
+    return pad + ema_vals
 
 
 # ── Alert Checks ──────────────────────────────────────────────────────────────
 
-def check_pump_1h(ticker: dict) -> str | None:
-    """
-    1-hour pump check.
-    Compares current price vs open price of the latest closed 1h candle.
-    We use Binance's 1h priceChange which is actually 24h — so we pull klines instead.
-    """
-    symbol = ticker["symbol"]
-    raw = get_klines(symbol, "1h", 3)
-    if len(raw) < 2:
+def check_pump(coin):
+    """5%+ gain in last 1 hour."""
+    symbol     = coin.get("symbol", "").upper()
+    change_1h  = coin.get("price_change_percentage_1h_in_currency")
+    price      = coin.get("current_price", 0)
+
+    if change_1h is None:
         return None
-
-    candle   = raw[-2]           # last *closed* candle
-    o        = float(candle[1])  # open
-    c        = float(candle[4])  # close
-    change_pct = ((c - o) / o) * 100
-
-    if change_pct >= PUMP_THRESHOLD:
+    if change_1h >= PUMP_THRESHOLD:
         return (
             f"🚀 *PUMP ALERT*\n"
-            f"Coin   : `{symbol}`\n"
-            f"Change : *+{change_pct:.2f}%* (last 1h candle)\n"
-            f"Open   : {o:.6g}  →  Close: {c:.6g}\n"
+            f"Coin   : `{symbol}/USDT`\n"
+            f"Change : *+{change_1h:.2f}%* (1h)\n"
+            f"Price  : ${price:,.4g}\n"
         )
     return None
 
 
-def check_breakout(symbol: str, ohlcv: dict) -> str | None:
+def check_breakout(coin):
     """
-    Breakout: last closed candle closes ABOVE the highest high
-    of the prior 20 candles (resistance break).
+    Price within 0.5% of 24h high = breakout zone.
+    Simple but effective for quick scan.
     """
-    closes = ohlcv["close"]
-    highs  = ohlcv["high"]
+    symbol   = coin.get("symbol", "").upper()
+    price    = coin.get("current_price", 0)
+    high_24h = coin.get("high_24h", 0)
+    low_24h  = coin.get("low_24h", 0)
 
-    if len(closes) < 22:
+    if not high_24h or not price:
         return None
 
-    # Last closed candle = index -2 (index -1 is the forming candle)
-    prev_high_window = highs[-22:-2]   # 20 candles before last closed
-    resistance       = max(prev_high_window)
-    current_close    = closes[-2]
-    prev_close       = closes[-3]
+    # Price within 0.5% of 24h high
+    distance_pct = ((high_24h - price) / high_24h) * 100
 
-    if current_close > resistance and prev_close <= resistance:
-        breakout_pct = ((current_close - resistance) / resistance) * 100
+    # Also check: price broke above and is at new high
+    change_24h = coin.get("price_change_percentage_24h_in_currency", 0) or 0
+
+    if distance_pct <= 0.5 and change_24h >= 3.0:
+        range_pct = ((high_24h - low_24h) / low_24h) * 100
         return (
-            f"⚡ *BREAKOUT ALERT*\n"
-            f"Coin       : `{symbol}`\n"
-            f"Broke      : {resistance:.6g} resistance\n"
-            f"Close      : {current_close:.6g} (+{breakout_pct:.2f}%)\n"
-            f"Lookback   : 20 candles (1h)\n"
+            f"⚡ *BREAKOUT ZONE*\n"
+            f"Coin       : `{symbol}/USDT`\n"
+            f"Price      : ${price:,.4g}\n"
+            f"24h High   : ${high_24h:,.4g} (only {distance_pct:.2f}% away)\n"
+            f"24h Range  : {range_pct:.1f}%\n"
         )
     return None
 
 
-def check_ema_rejection(symbol: str, ohlcv: dict) -> list[str]:
+def check_ema_rejection(coin_id, symbol):
     """
-    EMA Rejection (SMC confluence):
-    - Price wicks INTO EMA20 or EMA50
-    - Candle closes back above/below the EMA (rejection)
-    - Confirms trend continuation setup
+    EMA20/50 rejection on 30min candles.
+    Wick touches EMA, candle closes on other side.
     """
-    closes = ohlcv["close"]
-    highs  = ohlcv["high"]
-    lows   = ohlcv["low"]
-    alerts = []
+    raw = get_ohlc(coin_id, days=2)
+    if not raw or len(raw) < 52:
+        return []
 
-    if len(closes) < KLINE_LIMIT:
-        return alerts
+    opens  = [c[1] for c in raw]
+    highs  = [c[2] for c in raw]
+    lows   = [c[3] for c in raw]
+    closes = [c[4] for c in raw]
+
+    alerts = []
 
     for period in EMA_PERIODS:
         ema_series = calc_ema(closes, period)
         if not ema_series or ema_series[-2] is None:
             continue
 
-        ema_val      = ema_series[-2]   # EMA at last closed candle
-        c_close      = closes[-2]
-        c_low        = lows[-2]
-        c_high       = highs[-2]
-        prev_close   = closes[-3]
+        ema_val    = ema_series[-2]
+        c_close    = closes[-2]
+        c_low      = lows[-2]
+        c_high     = highs[-2]
 
-        # ── Bullish rejection (wick below EMA, close above) ──
-        wick_touched_below = c_low <= ema_val * (1 + EMA_TOUCH_PCT)
-        close_above        = c_close > ema_val
-        was_bearish_before = prev_close < ema_val  # came from below, now rejected up
-
-        if wick_touched_below and close_above:
+        # Bullish rejection: wick below EMA, close above
+        if c_low <= ema_val * (1 + EMA_TOUCH_PCT) and c_close > ema_val:
             alerts.append(
-                f"📈 *EMA{period} BULLISH REJECTION*\n"
-                f"Coin   : `{symbol}`\n"
-                f"EMA{period}  : {ema_val:.6g}\n"
-                f"Candle : Low {c_low:.6g} → Close {c_close:.6g}\n"
-                f"Signal : Wick kissed EMA, closed above → Bullish\n"
+                f"📈 *EMA{period} BULLISH REJECTION* (30m)\n"
+                f"Coin   : `{symbol}/USDT`\n"
+                f"EMA{period}  : ${ema_val:,.4g}\n"
+                f"Candle : Low ${c_low:,.4g} → Close ${c_close:,.4g}\n"
+                f"Signal : Wick kissed EMA, closed above ✅\n"
             )
 
-        # ── Bearish rejection (wick above EMA, close below) ──
-        wick_touched_above = c_high >= ema_val * (1 - EMA_TOUCH_PCT)
-        close_below        = c_close < ema_val
-
-        if wick_touched_above and close_below:
+        # Bearish rejection: wick above EMA, close below
+        if c_high >= ema_val * (1 - EMA_TOUCH_PCT) and c_close < ema_val:
             alerts.append(
-                f"📉 *EMA{period} BEARISH REJECTION*\n"
-                f"Coin   : `{symbol}`\n"
-                f"EMA{period}  : {ema_val:.6g}\n"
-                f"Candle : High {c_high:.6g} → Close {c_close:.6g}\n"
-                f"Signal : Wick kissed EMA, closed below → Bearish\n"
+                f"📉 *EMA{period} BEARISH REJECTION* (30m)\n"
+                f"Coin   : `{symbol}/USDT`\n"
+                f"EMA{period}  : ${ema_val:,.4g}\n"
+                f"Candle : High ${c_high:,.4g} → Close ${c_close:,.4g}\n"
+                f"Signal : Wick kissed EMA, closed below ⚠️\n"
             )
 
     return alerts
@@ -221,52 +196,53 @@ def check_ema_rejection(symbol: str, ohlcv: dict) -> list[str]:
 
 # ── Main Scan ─────────────────────────────────────────────────────────────────
 
-def run_scan() -> None:
+def run_scan():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     print(f"[{now_utc}] Starting crypto scan...")
 
-    tickers = get_top_usdt_pairs()
-    print(f"Scanning {len(tickers)} USDT pairs...")
+    try:
+        coins = get_top_coins()
+    except Exception as e:
+        send_telegram(f"❌ CoinGecko API error: {e}")
+        return
 
-    all_alerts: list[str] = []
+    print(f"Scanning {len(coins)} coins...")
+    all_alerts = []
 
-    for i, ticker in enumerate(tickers):
-        symbol = ticker["symbol"]
+    for i, coin in enumerate(coins):
+        symbol  = coin.get("symbol", "").upper()
+        coin_id = coin.get("id", "")
 
-        # ── 1. Pump check (uses 1h kline, fetched inside function) ──
-        pump_alert = check_pump_1h(ticker)
-        if pump_alert:
-            all_alerts.append(pump_alert)
+        # 1. Pump check
+        pump = check_pump(coin)
+        if pump:
+            all_alerts.append(pump)
 
-        # ── 2. Breakout + EMA rejection (shared kline fetch) ──
-        raw = get_klines(symbol, "1h", KLINE_LIMIT)
-        if raw:
-            ohlcv = parse_klines(raw)
+        # 2. Breakout check
+        bo = check_breakout(coin)
+        if bo:
+            all_alerts.append(bo)
 
-            bo = check_breakout(symbol, ohlcv)
-            if bo:
-                all_alerts.append(bo)
-
-            ema_alerts = check_ema_rejection(symbol, ohlcv)
-            all_alerts.extend(ema_alerts)
-
-        # Be polite to Binance — avoid rate limit (1200 req/min weight limit)
-        if i % 10 == 9:
-            time.sleep(0.5)
+        # 3. EMA rejection (only for top 30 to avoid rate limit)
+        if i < 30:
+            try:
+                ema_alerts = check_ema_rejection(coin_id, symbol)
+                all_alerts.extend(ema_alerts)
+            except Exception:
+                pass
+            time.sleep(1.5)  # CoinGecko free tier: 30 req/min
 
     # ── Send results ──────────────────────────────────────────────────────────
     if all_alerts:
-        header = f"🔔 *Crypto Alerts* | {now_utc}\n{'─'*30}\n"
-        # Split into chunks of 10 alerts to avoid Telegram 4096 char limit
-        chunk_size = 10
-        for chunk_start in range(0, len(all_alerts), chunk_size):
-            chunk = all_alerts[chunk_start:chunk_start + chunk_size]
+        header = f"🔔 *Crypto Alerts* | {now_utc}\n{'─'*28}\n"
+        chunk_size = 8
+        for i in range(0, len(all_alerts), chunk_size):
+            chunk = all_alerts[i:i + chunk_size]
             body  = "\n".join(chunk)
             send_telegram(header + body)
-            time.sleep(1)  # avoid Telegram flood
+            time.sleep(1)
         print(f"Sent {len(all_alerts)} alerts.")
     else:
-        # Send a heartbeat so you know bot is alive
         send_telegram(f"✅ *Scan complete* | {now_utc}\nNo significant signals this hour.")
         print("No alerts this scan.")
 
